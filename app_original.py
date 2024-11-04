@@ -1,5 +1,5 @@
 import streamlit as st
-from PIL import Image
+from PIL import Image, ImageDraw
 import PyPDF2
 import re
 import json
@@ -99,6 +99,100 @@ def extract_date_from_text(pdf_text):
             return date_match.group(1)
     return None
 
+# Function to extract dates from PDF text with coordinates
+def extract_dates_with_coordinates(file):
+    date_patterns = [
+        r'\b(\d{1,2}\.\d{1,2}\.\d{4})\b',  # dd.mm.yyyy
+        r'\b(\d{4}-\d{2}-\d{2})\b',  # yyyy-mm-dd
+        r'\b([A-Za-z]+ \d{1,2}, \d{4})\b',  # Month dd, yyyy
+        r'\b([A-Za-z]+ \d{1,2} , \d{4})\b',  # Month dd , yyyy
+        r'\b(\d{1,2}/\d{1,2}/\d{4})\b',  # mm/dd/yyyy or dd/mm/yyyy
+        r'\b([A-Za-z]{3} \d{1,2} \d{4})\b'  # Mon dd yyyy
+    ]
+    
+    date_coordinates = []
+    
+    # Read the file bytes to avoid closed file error
+    file_bytes = file.read()
+    
+    # Load the PDF document from file bytes
+    doc = pymupdf.open(stream=file_bytes, filetype="pdf")
+    
+    for page_num in range(doc.page_count):
+        page = doc[page_num]
+        pix = page.get_pixmap()  # render page to an image
+        print(pix.size)
+        pix.save("page-%i.png" % page.number) 
+        print("The page is:", dir(page))
+        page_text = page.get_text("text")
+        
+        for pattern in date_patterns:
+            matches = re.finditer(pattern, page_text)
+            
+            for match in matches:
+                text = match.group()
+                # Get the position of the matched date on the page
+                text_instances = page.search_for(text)
+                
+                for inst in text_instances:
+                    x0, y0, x1, y1 = inst.x0, inst.y0, inst.x1, inst.y1
+                    date_coordinates.append({
+                        "date_text": text,
+                        "coordinates": (x0, y0, x1, y1),
+                        "page": page_num
+                    })
+                    
+    return date_coordinates
+
+def draw_bounding_boxes(image_array, date_info_list, metadata_date):
+    # Make a copy of the image array to avoid modifying the original
+    image_with_boxes = image_array.copy()
+    
+    # Convert metadata_date to a string to avoid type issues with putText
+    metadata_date_str = str(metadata_date)
+
+    # Draw bounding boxes and metadata dates on the image
+    for date_info in date_info_list:
+        # Ensure each coordinate is a float or int and convert it to an int
+        x0, y0, x1, y1 = date_info['coordinates']
+        
+        # Convert coordinates to integers safely
+        x0 = int(float(x0))
+        y0 = int(float(y0))
+        x1 = int(float(x1))
+        y1 = int(float(y1))
+        
+        # Draw the rectangle with a thinner border and blue color
+        box_color = (0, 128, 255)  # Orange color for the box
+        cv2.rectangle(image_with_boxes, (x0, y0), (x1, y1), box_color, 1)  # Reduced thickness
+
+        # Calculate the position and size of the text background
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.6
+        thickness = 1
+        (text_width, text_height), baseline = cv2.getTextSize(metadata_date_str, font, font_scale, thickness)
+        
+        # Draw a semi-transparent background rectangle for the text
+        overlay = image_with_boxes.copy()
+        text_bg_color = (0, 0, 0)  # Black background for text
+        alpha = 0.4  # Transparency level for the text background
+        cv2.rectangle(
+            overlay,
+            (x0, y0 - text_height - baseline - 5),
+            (x0 + text_width, y0 - 5),
+            text_bg_color,
+            -1
+        )
+        # Add overlay with alpha transparency
+        cv2.addWeighted(overlay, alpha, image_with_boxes, 1 - alpha, 0, image_with_boxes)
+
+        # Draw the metadata date text on top of the background
+        text_color = (255, 255, 255)  # White color for text
+        text_position = (x0, y0 - 10)
+        cv2.putText(image_with_boxes, metadata_date_str, text_position, font, font_scale, text_color, thickness, cv2.LINE_AA)
+    
+    return image_with_boxes
+
 def convert_to_common_format(date_string):
     if date_string is None:
         return None
@@ -163,6 +257,7 @@ def func_1(x,uploaded_file):
         with NamedTemporaryFile(dir='.',suffix='.jpg',delete=False) as f:
             f.write(uploaded_file.getbuffer())
             out=detector.onImage(f.name)
+
               
             tout="INVOICE IS TAMPERED"
             if out==tout:
@@ -171,6 +266,8 @@ def func_1(x,uploaded_file):
                     with open(uploaded_file.name,mode = "wb") as f: 
                         f.write(uploaded_file.getbuffer())
                         detector.onImage(f.name)
+                        
+                        
                         img_ = Image.open("result.jpg")
                         st.image(img_, caption='Proccesed Image.')
 
@@ -178,6 +275,7 @@ def func_1(x,uploaded_file):
                 st.markdown('<span style="color:green">**' + out + '**</span>', unsafe_allow_html=True)
         os.remove(f.name) 
     return out
+
 
 
 def convert_pdf_to_images(pdf_file):
@@ -227,7 +325,7 @@ def func_3(x, file):
                 return False
         else:
             # Return True if no QR code is detected
-            return True
+            return "No qr detected"
 
         # Clean up temporary file
         os.remove(f.name)
@@ -247,6 +345,8 @@ def convert_to_readable(metadata):
             
         readable_metadata[key] = value
     return readable_metadata
+
+
 
 def initialization():
     """Loads configuration and model for the prediction.
@@ -295,6 +395,15 @@ def initialization():
 def inference(predictor, img):
     return predictor(img)
 
+def get_highest_confidence(outputs):
+    """Returns the highest confidence score from all detections."""
+    if "instances" in outputs and len(outputs["instances"]) > 0:
+        scores = outputs["instances"].scores
+        highest_score = scores.max().item()
+        return highest_score
+    else:
+        return None
+
 def output_image(cfg, img, outputs, metadata):
     v = Visualizer(img[:, :, ::-1], metadata, scale=0.75)
     out = v.draw_instance_predictions(outputs["instances"].to("cpu"))
@@ -333,9 +442,14 @@ def scrape_multi_font_text(file):
     pdf.close()
     return results
 
-def draw_boxes(image, boxes):
-    image_copy = np.copy(image)
-    
+def draw_boxes(image, boxes, convert_to_bgr=True):
+    # If the image is in RGB format, convert to BGR to ensure correct colors
+    if convert_to_bgr:
+        image_copy = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+    else:
+        image_copy = np.copy(image)
+
+    # Draw bounding boxes on the image
     for box in boxes:
         _, x0, y0, x1, y1, _ = box
         cv2.rectangle(image_copy, (int(x0), int(y0)), (int(x1), int(y1)), (0, 255, 0), 2)
@@ -409,9 +523,11 @@ def main():
                     abs_popler_path = os.path.abspath(os.path.join(os.getcwd(), poppler_path_1))     
                     pdf_images = convert_from_path(temp_path, 500, poppler_path=abs_popler_path)  # SN3 changed
                     images = convert_pdf_to_images(temp_path)
+                    list_images = list(images)
+                    print(list_images[0].size)
                     image_path = temp_path
                     # Remove the temporary file after conversion
-                    os.remove(temp_path)
+                    
                     st.image(pdf_images, caption="Uploaded Image", width = 500)  # Expand the Image
 
                     # Metadata Analysis for PDF
@@ -423,14 +539,41 @@ def main():
                     formatted_date_from_text = convert_to_common_format(date_from_text)
                     formatted_metadata_date = [convert_to_common_format(date) for date in metadata_date]
 
-                    # Display PDF Metadata Analysis
+                    # Extract and format dates from text
+                    date_instances = extract_dates_with_coordinates(bytes_stream)
+                    print("The coordinates are:", date_instances)
+                    st.subheader(f"The coordinates are : {date_instances}")
+                    mismatched_dates = []
+
+                    for date_info in date_instances:
+                        formatted_text_date = convert_to_common_format(date_info["date_text"])
+
+                        if formatted_text_date and formatted_text_date != formatted_metadata_date[0]:
+                            mismatched_dates.append(date_info)
+
+                    # Display results with bounding boxes if there are mismatches
+                    if formatted_metadata_date and formatted_date_from_text and formatted_metadata_date[0] != formatted_date_from_text:
+                        st.write("Mismatched dates detected in the document:")
+                        img_array = np.array(list_images[0])
+                        images_with_boxes = draw_bounding_boxes(img_array, date_instances, formatted_metadata_date)  
+                        
+                        st.image(images_with_boxes, caption=f"Page with Highlighted Dates", use_column_width=True)
+
+                        output_folder = "output_images"
+                        os.makedirs(output_folder, exist_ok=True)
+                        output_path = os.path.join(output_folder, "metadata.png")
+
+                        # Save the image to the specified path
+                        cv2.imwrite(output_path, images_with_boxes)
+                    else:
+                        st.write("No mismatches found between metadata creation date and dates in the document text.")
                     
                     #Metadata Check
 
                     if formatted_metadata_date and formatted_date_from_text and formatted_metadata_date[0] == formatted_date_from_text:
-                        pdf_metadata_status = "Matched"
+                        pdf_metadata_status = "Metadata Matched"
                     else:
-                        pdf_metadata_status = "Not Matched"
+                        pdf_metadata_status = "Metadata Not Matched"
 
                                 
 
@@ -462,6 +605,13 @@ def main():
                         img = first_page.get_pixmap()
                         img_array = np.frombuffer(img.samples, dtype=np.uint8).reshape((img.height, img.width, img.n)).copy()
                         img_with_boxes = draw_boxes(img_array, results)
+
+                        output_folder = "output_images"
+                        os.makedirs(output_folder, exist_ok=True)
+                        output_path = os.path.join(output_folder, "font_analysis_result.png")
+
+                        # Save the image to the specified path
+                        cv2.imwrite(output_path, img_with_boxes)
                         
                         if results:  # Check if the results indicate tampering
                             font_status = "Tampered"
@@ -480,14 +630,18 @@ def main():
                     
                     
                     object_detection_status = "No Tampered Regions"
+                    score_obj = 0  # Initialize score_obj with a default value
                     try:
                         for img in images:
                             if img is not None:
                                 detector = Detector(model_type="objectDetection")
                                 out = detector.onImage(file.name)
+                                
+                                st.header(f"The highest confidence for object detection is: {score_obj}")
                                 tout = "INVOICE IS TAMPERED"
                                 if out == tout:
                                     object_detection_status = "Tampered Regions"
+                                    score_obj = detector.get_highest_confidence_score_obj(file.name) if objectdetection_status == "Tampered Regions" else 0
                                     with open(file.name, mode="wb") as f:
                                         f.write(file.getbuffer())
                                         detector.onImage(f.name)
@@ -498,9 +652,9 @@ def main():
                     except Exception as e:
                         object_detection_status = f"Error: {str(e)}"
 
-                    
 
-                    
+
+
 
 
                     # QR Code Analysis for each PDF page
@@ -540,10 +694,13 @@ def main():
                         metadata = MetadataCatalog.get("data-train2")
                         img_np = np.array(pdf_image)
                         outputs = inference(predictor, img_np)
+                        score_instance = get_highest_confidence(outputs) if len(outputs['instances']) > 0 else 0
+                        st.subheader(f"The confidence of instance is:{score_instance}")
                         if len(outputs['instances']) > 0:
                             detectron_status = "Tampered Regions"
                             out_image = output_image(cfg, img_np, outputs, metadata)
                             st.image(out_image, caption=f'Processed Image - Page {page_num + 1}', use_column_width=True)
+
                             
                     
                     # Create a summary for the current file
@@ -559,6 +716,7 @@ def main():
                     alert_status = "Yes" if tampering_modules_string_ind_file != "None" else "No"
 
                     st.subheader("Summary")
+
 
                     # Create a unique named anchor for the individual summary
                     st.markdown(f'<a name="{file_id}"></a>', unsafe_allow_html=True)
@@ -600,7 +758,22 @@ def main():
                     #         out_image = output_image(cfg, img_np, outputs, metadata)
                     #         st.image(out_image, caption=f'Processed Image - Page {page_num + 1}', use_column_width=True)  # Output 6
                     
-                   
+
+                    MODULE_WEIGHTS = {
+                    "Metadata Analysis": 2,
+                    "Font Analysis": 3,
+                    "Object Detection": 4,
+                    "Instance Segmentation": 4
+                    }
+
+                    # Define the color codes for different statuses
+                    STATUS_COLORS = {
+                        "Trusted": "#C8E6C9",     # Light Green for Safe
+                        "Warning": "#FFF9C4",  # Light Yellow for Warning
+                        "High risk": "#FFCDD2"  # Light Red for Tampered
+                    }
+
+
 
                     # Append this file's summary to the overall summary table
                     summary_data.append({
@@ -612,7 +785,9 @@ def main():
                         "Object Detection Status": object_detection_status,
                         "Instance Segmentation Status": detectron_status,
                         "Tampering detected modules": tampering_modules_string_ind_file,
-                        "Status": alert_status
+                        "Status": alert_status,
+                        "Instance Score": score_instance,   
+                        "Object Score": score_obj   
                     })
 
                     # st.header("Copy Move Detection:") #SN3 commented
@@ -721,12 +896,14 @@ def main():
 
 
                 # OCR Analysis for Images
-                ocr_status = "Not Matched"
+                ocr_status = "QR data Not Matched"
                 try:
                     out_func = func_3('ocr',file)
                     
                     if out_func == True:
-                        ocr_status = "Matched"
+                        ocr_status = "QR data Matched"
+                    if out_func == "No qr detected":
+                        ocr_status = "No QR detected"
 
                 except Exception as e:
                     ocr_status = f"error: {str(e)}"
@@ -739,21 +916,31 @@ def main():
                     metadata = MetadataCatalog.get("data-train2")
                     img_np = np.array(image)
                     outputs = inference(predictor, img_np)
+                    score_instance = get_highest_confidence(outputs) if len(outputs['instances']) > 0 else 0
                     if len(outputs['instances']) > 0:
                         detectron_status = "Tampered Regions"
                         st.subheader("Pixel Manipulation Detection")
                         out_image = output_image(cfg, img_np, outputs, metadata)
                         st.image(out_image, caption='Processed Image', use_column_width=True)
+                        output_folder = "output_images"
+                        os.makedirs(output_folder, exist_ok=True)
+                        output_path = os.path.join(output_folder, "instance_segmentation_result.jpg")
+
+                        # Save the image to the specified path
+                        cv2.imwrite(output_path, out_image)
                 except Exception as e:
                     st.error(f"Error during instance segmentation analysis: {e}")
 
                 # Object detection
                 objectdetection_status = "No Tampered Regions"
+                score_obj = 0
                 try:
                     detector = Detector(model_type="objectDetection")
                     od_result = detector.onImage(file.name)
+                    
                     if od_result == "INVOICE IS TAMPERED":
                         objectdetection_status = "Tampered Regions"
+                        score_obj = detector.get_highest_confidence_score_obj(file.name) if objectdetection_status == "Tampered Regions" else 0
                         with open(file.name, mode="wb") as f:
                             f.write(file.getbuffer())
                             detector.onImage(f.name)
@@ -762,6 +949,10 @@ def main():
 
                 except Exception as e:
                     st.error(f"Error during object detection analysis: {e}")
+                
+
+                st.subheader(f"The instance score is {score_instance}")
+                st.subheader(f"The instance score is {score_instance}")
 
                 # Summarize individual file tampering modules
                 # Create a summary for the current file
@@ -770,7 +961,7 @@ def main():
                         ("QR and OCR", ocr_status),
                         ("Object Detection", objectdetection_status),
                         ("Instance Segmentation", detectron_status)
-                    ] if status and status != "No Tampering" and status != "No Tampered Regions" and status != "Matched"
+                    ] if status and status != "No Tampering" and status != "No Tampered Regions" and status != "Matched" and status != "No QR detected"
                 ]) or "None"
 
                 alert_status = "Yes" if tampering_modules_string_ind_file != "None" else "No"
@@ -801,6 +992,23 @@ def main():
                         unsafe_allow_html=True
                     )
 
+                MODULE_WEIGHTS = {
+                    "Metadata Check": 2,
+                    "QR and OCR" : 2,
+                    "Font Analysis": 3,
+                    "Object Detection": 4,
+                    "Instance Segmentation": 4
+                    }
+
+                # Define the color codes for different statuses
+                STATUS_COLORS = {
+                    "Trusted": "#C8E6C9",     # Light Green for Safe
+                    "Warning": "#FFF9C4",  # Light Yellow for Warning
+                    "High risk": "#FFCDD2"  # Light Red for Tampered
+                }
+
+                
+
                 # Append this file's summary to the overall summary table
                 summary_data.append({
                 "Sl. No.": file_no + 1,
@@ -811,7 +1019,9 @@ def main():
                 "Object Detection Status": objectdetection_status,
                 "Instance Segmentation Status": detectron_status,
                 "Tampering detected modules": tampering_modules_string_ind_file,
-                "Status": alert_status
+                "Status": alert_status,
+                "Instance Score": score_instance,   
+                "Object Score": score_obj           
                 })
     
 
@@ -900,24 +1110,86 @@ def main():
 
         # Convert the data into a DataFrame
         summary_df = pd.DataFrame(summary_data)
+        
+        
+        
+        def get_color_based_on_status(status, threshold=None):
+            # Check for metadata conditions
+            if status == "Metadata Matched":
+                return "#C8E6C9"  # Green for Matched in Metadata Check
+            elif status == "Metadata Not Matched":
+                return "#FFF9C4"  # Yellow for Not Matched in Metadata Check
 
-        # Convert DataFrame to Markdown table
+            # Check for QR code data match conditions
+            elif status == "QR data Matched":
+                return "#C8E6C9"  # Green for Matched in QR code data match
+            elif status == "QR data Not Matched":
+                return "#FFCDD2"  # Red for Not Matched in QR code data match
+
+            # General status conditions for tampering
+            elif status == "No Tampering":
+                return "#C8E6C9"  # Green for No Tampering
+            elif status == "Tampered":
+                return "#FFCDD2"  # Red for Tampered
+
+            # Threshold-based conditions for object detection and instance segmentation
+            if threshold is not None:
+                if threshold < 0.40:
+                    return "#C8E6C9"  # Green
+                elif 0.40 <= threshold < 0.70:
+                    return "#FFF9C4"  # Yellow
+                elif threshold >= 0.70:
+                    return "#FFCDD2"  # Red
+
+            # Default grey for undefined or unrecognized cases
+            return "#808080"
+
+        def colorize_row(row):
+            # Metadata Check
+            row["Metadata Check"] = f'<span style="background-color: {get_color_based_on_status(row["Metadata Check"])};">{row["Metadata Check"]}</span>'
+            
+            # QR code data match
+            row["QR code data match"] = f'<span style="background-color: {get_color_based_on_status(row["QR code data match"])};">{row["QR code data match"]}</span>'
+            
+            # Font Analysis
+            row["Font Analysis"] = f'<span style="background-color: {get_color_based_on_status(row["Font Analysis"])};">{row["Font Analysis"]}</span>'
+            
+            # Object Detection Status
+            object_detection_percentage = row["Object Score"] if row["Object Score"] else 0
+            row["Object Detection Status"] = f'<span style="background-color: {get_color_based_on_status("", object_detection_percentage)};">{row["Object Detection Status"]}</span>'
+            
+            # Instance Segmentation Status
+            instance_segmentation_percentage = row["Instance Score"] if row["Instance Score"] else 0
+            row["Instance Segmentation Status"] = f'<span style="background-color: {get_color_based_on_status("", instance_segmentation_percentage)};">{row["Instance Segmentation Status"]}</span>'
+            
+            return row
+            
+
+        
+        # Apply colorization logic to all rows
+        summary_df = summary_df.apply(colorize_row, axis=1)
+
+        # Drop 'Instance Score' and 'Object Score' columns from the DataFrame
+        summary_df = summary_df.drop(columns=['Instance Score', 'Object Score'])
+
+        # Convert DataFrame to HTML table for display
         summary_table = summary_df.to_html(escape=False, index=False)
 
-        # Assign an ID to the summary report section
+        # Display the summary table in Streamlit
         st.markdown('<h2 id="summary-report">Summary Report:</h2>', unsafe_allow_html=True)
-
-        # Display the Markdown table
         st.markdown(summary_table, unsafe_allow_html=True)
-        
-        #Add download button for CSV
-        csv = summary_df.to_csv(index=False)
+
+        # Download button for CSV (without HTML)
+        summary_csv_df = summary_df.copy()
+        summary_csv_df["File ID"] = summary_csv_df["File ID"].apply(lambda x: x.split('>')[1].split('<')[0])  # Extract plain file ID
+        csv = summary_csv_df.to_csv(index=False)
         st.download_button(
-            label = "Download summary as CSV",
-            data = csv,
-            file_name = 'summary_report.csv',
+            label="Download summary as CSV",
+            data=csv,
+            file_name='summary_report.csv',
             mime='text/csv',
         )
 
+            
 if __name__ == '__main__':
 		main()
